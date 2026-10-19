@@ -89,6 +89,73 @@ interface ParamReader {
   get(name: string): string | null
 }
 
+/** The `has` half of the same two types, needed to inspect the raw URL. */
+interface ParamPresence {
+  has(name: string): boolean
+}
+
+/** The read + iterate surface a full `URLSearchParams`-like object exposes. */
+interface ParamCollection extends ParamReader, ParamPresence {
+  entries(): IterableIterator<[string, string]>
+}
+
+/**
+ * Every query key this view owns — including keys `parseHistoryFilters` does
+ * *not* read.
+ *
+ * `type` is what the service layer calls the direction filter
+ * (`services/index.ts` sends `type=` to the API), so bookmarks and hand-written
+ * links can carry `?type=sent` while the page serialises the same filter as
+ * `dir`. Unknown values (`?status=CONFIRMED`) are likewise parsed down to the
+ * defaults, which leaves the in-memory state reset while the raw params stay in
+ * the URL. Reset has to strip all of these keys, not just the ones that parsed
+ * to something active — see #878.
+ */
+export const HISTORY_FILTER_PARAM_KEYS = [
+  'status',
+  'asset',
+  'dir',
+  'type',
+  'range',
+  'from',
+  'to',
+  'q',
+] as const
+
+const HISTORY_FILTER_PARAM_KEY_SET = new Set<string>(HISTORY_FILTER_PARAM_KEYS)
+
+/**
+ * True when the URL carries *any* history filter param, recognised or not.
+ *
+ * `hasActiveFilters` only reports filters the parser understood, so a stale
+ * `?status=CONFIRMED&type=sent` reads as "no filters" while still sitting in the
+ * query string — and with no reset control offered, nothing could ever remove
+ * it. The reset button is gated on this instead.
+ */
+export function hasHistoryFilterParams(params: ParamPresence): boolean {
+  return HISTORY_FILTER_PARAM_KEYS.some((key) => params.has(key))
+}
+
+/**
+ * Render `params` with every history filter key removed, keeping unrelated
+ * query params (tracking tags, feature flags) untouched.
+ *
+ * Returns `''` when nothing is left, so callers can navigate to the bare
+ * pathname and be certain no filter param — recognised or stale — survives the
+ * reset (#878).
+ */
+export function clearHistoryFilterParams(params: ParamCollection): string {
+  const next = new URLSearchParams()
+
+  for (const [key, value] of params.entries()) {
+    if (!HISTORY_FILTER_PARAM_KEY_SET.has(key)) {
+      next.append(key, value)
+    }
+  }
+
+  return next.toString()
+}
+
 const STATUS_VALUES = new Set<string>(
   HISTORY_STATUS_FILTERS.map((option) => option.value),
 )

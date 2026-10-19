@@ -38,13 +38,13 @@ class TransactionQueueDB {
     })
   }
 
-  async addTransaction(transaction: QueuedTransaction): Promise<void> {
+  async addTransaction(queued: QueuedTransaction): Promise<void> {
     if (!this.db) await this.init()
 
     return new Promise((resolve, reject) => {
-      const transaction = this.db!.transaction([STORE_NAME], 'readwrite')
-      const store = transaction.objectStore(STORE_NAME)
-      const request = store.add(transaction)
+      const tx = this.db!.transaction([STORE_NAME], 'readwrite')
+      const store = tx.objectStore(STORE_NAME)
+      const request = store.add(queued)
 
       request.onerror = () => reject(request.error)
       request.onsuccess = () => resolve()
@@ -91,13 +91,13 @@ class TransactionQueueDB {
     })
   }
 
-  async updateTransaction(transaction: QueuedTransaction): Promise<void> {
+  async updateTransaction(queued: QueuedTransaction): Promise<void> {
     if (!this.db) await this.init()
 
     return new Promise((resolve, reject) => {
-      const transaction = this.db!.transaction([STORE_NAME], 'readwrite')
-      const store = transaction.objectStore(STORE_NAME)
-      const request = store.put(transaction)
+      const tx = this.db!.transaction([STORE_NAME], 'readwrite')
+      const store = tx.objectStore(STORE_NAME)
+      const request = store.put(queued)
 
       request.onerror = () => reject(request.error)
       request.onsuccess = () => resolve()
@@ -156,10 +156,31 @@ export async function getPendingTransactions(): Promise<QueuedTransaction[]> {
 
 export async function updateQueuedTransaction(transaction: QueuedTransaction): Promise<void> {
   await queueDB.updateTransaction(transaction)
+  notifyQueueChanged()
+}
+
+/** Tell listeners (queue list, nav badge) that the stored queue changed. */
+export const QUEUE_CHANGED_EVENT = 'transactionQueueChanged'
+
+function notifyQueueChanged(): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(QUEUE_CHANGED_EVENT))
+}
+
+/**
+ * Put a failed transaction back in the queue with a fresh retry budget and ask
+ * the processor to run again. No-op if the entry no longer exists.
+ */
+export async function retryQueuedTransaction(id: string): Promise<void> {
+  const existing = await queueDB.getTransaction(id)
+  if (!existing) return
+  await queueDB.updateTransaction({ ...existing, status: 'pending', retries: 0, lastError: undefined })
+  notifyQueueChanged()
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('processTransactionQueue'))
 }
 
 export async function removeQueuedTransaction(id: string): Promise<void> {
   await queueDB.deleteTransaction(id)
+  notifyQueueChanged()
 }
 
 export async function clearTransactionQueue(): Promise<void> {

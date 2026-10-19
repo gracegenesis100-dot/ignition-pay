@@ -21,7 +21,9 @@ import {
   HISTORY_DIRECTION_FILTERS,
   HISTORY_STATUS_FILTERS,
   availableAssets,
+  clearHistoryFilterParams,
   hasActiveFilters,
+  hasHistoryFilterParams,
   parseHistoryFilters,
   resolveDateRange,
   serialiseHistoryFilters,
@@ -233,13 +235,27 @@ export function HistoryPage() {
 
   const filtersAreActive = hasActiveFilters(filters)
 
+  /**
+   * #878 — gate the reset control on the *URL*, not on the parsed filters.
+   * Params the parser collapses to their defaults (`?status=CONFIRMED`,
+   * `?type=sent`, `?status=all`) leave the in-memory state looking unfiltered,
+   * so a button keyed on `filtersAreActive` never appeared and those params
+   * could not be cleared: navigating away and back then restored the stale
+   * query string. `hasHistoryFilterParams` covers every key the view owns.
+   */
+  const resetAvailable = hasHistoryFilterParams(searchParams)
+
   function clearFilters() {
     if (searchTimerRef.current) {
       clearTimeout(searchTimerRef.current)
       searchTimerRef.current = null
     }
     setSearchDraft(null)
-    router.replace(pathname, { scroll: false })
+    // Strip every history filter param — including ones the parser ignores —
+    // so the reset really lands on a clean URL and the default list (#878).
+    // Anything unrelated to filtering is kept.
+    const next = clearHistoryFilterParams(searchParams)
+    router.replace(next ? `${pathname}?${next}` : pathname, { scroll: false })
   }
 
   /**
@@ -463,7 +479,7 @@ export function HistoryPage() {
                 min={filters.from || undefined}
                 onChange={(e) => applyFilters({ to: e.target.value, range: 'custom' })}
               />
-              {filtersAreActive && (
+              {resetAvailable && (
                 <Button variant="ghost" size="sm" onClick={clearFilters}>
                   Clear filters
                 </Button>

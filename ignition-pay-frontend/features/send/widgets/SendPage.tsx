@@ -6,6 +6,8 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import Link from 'next/link'
 import { validateStellarAddress } from '@/lib/stellar/strkey'
+import { parsePaymentRequest } from '@/lib/stellar/paymentRequest'
+import { TransactionQueueList } from '@/components/transaction-queue-list'
 import {
   MEMO_TEXT_MAX_BYTES,
   MEMO_TYPES,
@@ -90,6 +92,26 @@ export function SendPage({ address: addressProp }: SendPageProps = {}) {
   const [isEstimatingFee, setIsEstimatingFee] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [optimisticId, setOptimisticId] = useState<string | null>(null)
+
+  // Prefill from an incoming payment request link (?destination=...&amount=...).
+  // The destination is validated first; a bad link shows a message instead of
+  // being passed to the API.
+  const [deepLinkError, setDeepLinkError] = useState<string | null>(null)
+  useEffect(() => {
+    const parsed = parsePaymentRequest(new URLSearchParams(window.location.search))
+    if (!parsed) return
+    if (!parsed.ok) {
+      setDeepLinkError(parsed.error)
+      return
+    }
+    setFormData((prev) => ({
+      ...prev,
+      recipient: parsed.destination,
+      amount: parsed.amount ?? prev.amount,
+      ...(parsed.memo ? { memoType: 'text' as MemoType, memo: parsed.memo } : {}),
+    }))
+    setRecipientTouched(true)
+  }, [])
 
   // Track online/offline status
   useEffect(() => {
@@ -423,6 +445,16 @@ export function SendPage({ address: addressProp }: SendPageProps = {}) {
 
       {/* Main Content */}
       <div className="max-w-2xl mx-auto px-6 py-8">
+        {deepLinkError && (
+          <div
+            role="alert"
+            className="mb-6 flex items-start gap-2 rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+          >
+            <AlertCircle size={16} className="mt-0.5 shrink-0" />
+            <span>{deepLinkError}</span>
+          </div>
+        )}
+        <TransactionQueueList />
         {/* Progress Steps */}
         <div className="flex items-center justify-center gap-4 mb-12">
           <div className="flex items-center justify-center w-10 h-10 rounded-full font-semibold transition-all bg-primary text-primary-foreground">

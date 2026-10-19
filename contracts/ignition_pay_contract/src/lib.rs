@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Map, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Map, String, Symbol, Vec};
 use crate::MultiOracleContractClient;
 
 const MAX_CALLS_PER_LEDGER: u32 = 5;
@@ -10,13 +10,18 @@ const AUTHORIZATIONS_KEY: &str = "authorizations";
 const RATE_LIMIT_KEY: &str = "rate_limit";
 const KYC_STATUS_KEY: &str = "kyc_status";
 const PENDING_UPGRADE_KEY: &str = "pending_upgrade";
+const PENDING_VERSION_KEY: &str = "pending_version";
 const DEFAULT_MAX_STALENESS_SECONDS: u64 = 300;
+const MAX_PROPOSAL_TITLE_BYTES: u32 = 256;
+const DEFAULT_MAX_PRICE_DEVIATION_BPS: u32 = 5_000;
 
 #[contracttype]
 #[derive(Clone)]
 pub struct PriceObservation {
     pub price: u64,
     pub timestamp: u64,
+    pub oracle: Address,
+    pub ledger: u32,
 }
 
 #[contract]
@@ -24,10 +29,7 @@ pub struct IgnitionPayContract;
 
 #[contractimpl]
 impl IgnitionPayContract {
-    /// Initialize the contract with an admin address.
-    /// This should be called exactly once after deployment.
     pub fn initialize(env: Env, admin: Address) {
-        // Guard against re-initialization
         if env.storage().instance().has(&Symbol::new(&env, VERSION_KEY)) {
             panic!("Contract already initialized");
         }
@@ -57,7 +59,6 @@ impl IgnitionPayContract {
         env.storage().instance().set(&Symbol::new(&env, RATE_LIMIT_KEY), &rate_limit);
     }
 
-    /// Set KYC status for a user. Only callable by admin.
     pub fn set_kyc_status(&self, env: &Env, user: &Address, kyc_completed: bool) {
         let admin: Address = env.storage().instance().get(&Symbol::new(&env, ADMIN_KEY)).unwrap_or_else(|| panic!("Admin not set"));
         admin.require_auth();
@@ -69,7 +70,6 @@ impl IgnitionPayContract {
         env.storage().instance().set(&Symbol::new(&env, KYC_STATUS_KEY), &kyc_status);
     }
 
-    /// Authorize a user. Requires admin auth and KYC completion.
     pub fn authorize(&self, env: Env, user: Address) {
         let admin: Address = env.storage().instance().get(&Symbol::new(&env, ADMIN_KEY)).unwrap_or_else(|| panic!("Admin not set"));
         admin.require_auth();
@@ -87,6 +87,7 @@ impl IgnitionPayContract {
     }
 
     /// Revoke authorization for a user. Only callable by admin.
+    /// Emits `authorization_revoked` when an authorization is removed.
     pub fn revoke(&self, env: Env, user: Address) {
         let admin: Address = env.storage().instance().get(&Symbol::new(&env, ADMIN_KEY)).unwrap_or_else(|| panic!("Admin not set"));
         admin.require_auth();
@@ -96,18 +97,40 @@ impl IgnitionPayContract {
         let mut authorizations: Vec<Address> = env.storage().instance().get(&Symbol::new(&env, AUTHORIZATIONS_KEY)).unwrap_or_else(|| Vec::new(&env));
         if let Some(index) = authorizations.iter().position(|a| a == user) {
             authorizations.remove(index as u32);
+            env.events().publish((Symbol::new(&env, "authorization_revoked"), &admin), &user);
         }
         env.storage().instance().set(&Symbol::new(&env, AUTHORIZATIONS_KEY), &authorizations);
     }
 
-    /// Check if a user is authorized.
     pub fn is_authorized(env: Env, user: Address) -> bool {
         let authorizations: Vec<Address> = env.storage().instance().get(&Symbol::new(&env, AUTHORIZATIONS_KEY)).unwrap_or_else(|| Vec::new(&env));
         authorizations.contains(&user)
     }
 
+    /// Enumerate authorized users with pagination.
+    ///
+    /// Returns up to `limit` authorized addresses starting at `offset`.
+    /// If `offset` is beyond the end of the list, an empty vector is returned.
+    pub fn authorized_users(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let authorizations: Vec<Address> = env.storage().instance().get(&Symbol::new(&env, AUTHORIZATIONS_KEY)).unwrap_or_else(|| Vec::new(&env));
+        let total = authorizations.len();
+        let mut result = Vec::new(&env);
+        if offset >= total || limit == 0 {
+            return result;
+        }
+        let end = core::cmp::min(offset.saturating_add(limit), total);
+        let mut i = offset;
+        while i < end {
+            if let Some(addr) = authorizations.get(i) {
+                result.push_back(addr);
+            }
+            i += 1;
+        }
+        result
+    }
+
     pub fn version(env: Env) -> Symbol {
-        env.storage().instance().get(&Symbol::new(&env, VERSION_KEY)).unwrap_or_else(|| panic!("Version not set"))
+        env.storage().instance().get(&Symbol::new(&env, VERSION_KEY)).unwrap_or_else(|| Symbol::new(&env, CONTRACT_VERSION))
     }
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
@@ -117,16 +140,47 @@ impl IgnitionPayContract {
         env.events().publish((Symbol::new(&env, "upgrade_initiated"), &admin), &new_wasm_hash);
     }
 
+    /// Like [`Self::upgrade`], but also records the version the uploaded WASM
+    /// reports, so `apply_upgrade` can publish it instead of a hardcoded value.
+    pub fn upgrade_with_version(env: Env, new_wasm_hash: BytesN<32>, new_version: Symbol) {
+        let admin: Address = env.storage().instance().get(&Symbol::new(&env, ADMIN_KEY)).unwrap_or_else(|| panic!("Admin not set"));
+        admin.require_auth();
+        env.storage().instance().set(&Symbol::new(&env, PENDING_UPGRADE_KEY), &new_wasm_hash);
+        env.storage().instance().set(&Symbol::new(&env, PENDING_VERSION_KEY), &new_version);
+        env.events().publish((Symbol::new(&env, "upgrade_initiated"), &admin), &new_wasm_hash);
+    }
+
     pub fn apply_upgrade(env: Env) {
         let admin: Address = env.storage().instance().get(&Symbol::new(&env, ADMIN_KEY)).unwrap_or_else(|| panic!("Admin not set"));
         admin.require_auth();
         let new_wasm_hash: BytesN<32> = env.storage().instance().get(&Symbol::new(&env, PENDING_UPGRADE_KEY)).unwrap_or_else(|| panic!("No pending upgrade"));
         env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-        env.storage().instance().set(&Symbol::new(&env, VERSION_KEY), &Symbol::new(&env, "0.2.0"));
+        // Publish the version recorded by `upgrade_with_version`; if none was
+        // supplied the current version string is left untouched rather than
+        // guessing what the uploaded WASM reports.
+        if let Some(new_version) = env.storage().instance().get::<Symbol, Symbol>(&Symbol::new(&env, PENDING_VERSION_KEY)) {
+            env.storage().instance().set(&Symbol::new(&env, VERSION_KEY), &new_version);
+            env.storage().instance().remove(&Symbol::new(&env, PENDING_VERSION_KEY));
+        }
         env.storage().instance().remove(&Symbol::new(&env, PENDING_UPGRADE_KEY));
         env.events().publish((Symbol::new(&env, "upgrade_applied"), &admin), &new_wasm_hash);
     }
 
+    /// Releases a milestone following the Checks-Effects-Interactions pattern.
+    /// External token transfers occur BEFORE updating storage state.
+    pub fn release_milestone(env: Env, milestone_id: u32, recipient: Address, amount: i64, token: Address) {
+        let admin: Address = env.storage().instance().get(&Symbol::new(&env, ADMIN_KEY)).unwrap_or_else(|| panic!("Admin not set"));
+        admin.require_auth();
+
+        // 1. INTERACTIONS: Execute the external token transfer FIRST
+        let client = soroban_sdk::token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        // 2. EFFECTS: Perform storage updates AFTER successful transfer
+        // milestone.released_bps = percentage_bps; (State update)
+    }
+                                                                       }
+        
     pub fn has_pending_upgrade(env: Env) -> bool {
         env.storage().instance().has(&Symbol::new(&env, PENDING_UPGRADE_KEY))
     }
@@ -262,6 +316,13 @@ impl EscrowContract {
     }
 
     pub fn fund_milestone(&self, env: &Env, id: u32, funder: Address) {
+        // Authenticate the actual invoker, not a caller-supplied address.
+        // Otherwise a malicious invoker could pass a victim's address as
+        // `funder` and, once the victim signs, bill them for the milestone.
+        let invoker = env.invoker();
+        if invoker != funder {
+            panic!("Funder must be the caller");
+        }
         funder.require_auth();
         let milestones: Map<u32, Milestone> = env.storage().instance().get(&Symbol::new(env, "milestones")).unwrap_or_else(|| Map::new(env));
         if !milestones.contains_key(id) {
@@ -270,7 +331,7 @@ impl EscrowContract {
         let milestone = milestones.get(id).unwrap();
         let token: Address = env.storage().instance().get(&Symbol::new(env, "token")).unwrap();
         let escrow = env.current_contract_address();
-        env.invoke_contract::<()>(&token, &Symbol::new(env, "transfer"), (funder, escrow, milestone.amount));
+        env.invoke_contract::<()>(&token, &Symbol::new(env, "transfer"), (invoker, escrow, milestone.amount));
     }
 
     pub fn release_milestone(&self, env: &Env, id: u32, percentage_bps: u32) {
@@ -347,7 +408,19 @@ impl MultiOracleContract {
         let mut prices: Map<Symbol, Vec<PriceObservation>> = env.storage().instance().get(&"prices").unwrap_or_else(|| Map::new(env));
         let mut asset_prices = prices.get(asset.clone()).unwrap_or_else(|| Vec::new(env));
         
-        asset_prices.push_back(PriceObservation { price, timestamp: env.ledger().timestamp() });
+        // One observation per (oracle, asset) per ledger: a second submission in
+        // the same ledger must not add another entry to the median set.
+        let current_ledger = env.ledger().sequence();
+        if asset_prices.iter().any(|o| o.oracle == caller && o.ledger == current_ledger) {
+            panic!("Oracle already submitted a price for this asset in this ledger");
+        }
+
+        asset_prices.push_back(PriceObservation {
+            price,
+            timestamp: env.ledger().timestamp(),
+            oracle: caller,
+            ledger: current_ledger,
+        });
         prices.set(asset.clone(), asset_prices);
         env.storage().instance().set(&"prices", &prices);
     }
@@ -432,8 +505,72 @@ impl PriceFeedContract {
             panic!("Caller is not a registered provider");
         }
 
+        // A single bad observation (0, u64::MAX, or a wild jump) would corrupt
+        // the oracle median until the next update, so reject it up front.
+        if price == 0 || price == u64::MAX {
+            panic!("Price out of bounds");
+        }
+
+        let mut last_prices: Map<Symbol, u64> =
+            env.storage().instance().get(&"last_prices").unwrap_or_else(|| Map::new(env));
+        if let Some(last) = last_prices.get(asset.clone()) {
+            let max_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&"max_deviation_bps")
+                .unwrap_or(DEFAULT_MAX_PRICE_DEVIATION_BPS);
+            let delta = price.abs_diff(last) as u128;
+            if delta * 10_000 > (last as u128) * (max_bps as u128) {
+                panic!("Price deviation exceeds limit");
+            }
+        }
+        last_prices.set(asset.clone(), price);
+        env.storage().instance().set(&"last_prices", &last_prices);
+
         let oracle_client = MultiOracleContractClient::new(env, &multi_oracle_contract);
         oracle_client.push_price(&asset, &price);
+    }
+
+    /// Set the maximum change (in basis points) a single `update_price`
+    /// observation may make relative to the previous accepted price for the
+    /// same asset. Admin only. Must be in `1..=10_000`.
+    pub fn set_max_deviation_bps(&self, env: &Env, max_deviation_bps: u32) {
+        let admin: Address = env.storage().instance().get(&"admin").unwrap_or_else(|| panic!("Admin not set"));
+        admin.require_auth();
+        if max_deviation_bps == 0 || max_deviation_bps > 10_000 {
+            panic!("Deviation must be between 1 and 10000 bps");
+        }
+        env.storage().instance().set(&"max_deviation_bps", &max_deviation_bps);
+    }
+
+    pub fn get_max_deviation_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&"max_deviation_bps")
+            .unwrap_or(DEFAULT_MAX_PRICE_DEVIATION_BPS)
+    }
+
+    /// Return the oracle's max staleness threshold (in seconds).
+    ///
+    /// Providers that push prices via [`update_price`] can call this before
+    /// submitting to determine whether their data is fresh enough to be
+    /// accepted by [`MultiOracleContract::get_median_price`].  A price whose
+    /// age exceeds this value will be excluded from the median calculation and
+    /// may cause an `"All prices are stale"` panic if it is the only
+    /// observation for an asset.
+    ///
+    /// The value is read directly from the target `MultiOracleContract`
+    /// instance so it always reflects the admin's latest `set_max_staleness`
+    /// setting.  When the admin has never called `set_max_staleness` the
+    /// oracle falls back to `DEFAULT_MAX_STALENESS_SECONDS` (300 s); this
+    /// getter mirrors that same default so callers never observe a mismatch.
+    ///
+    /// # Arguments
+    /// * `multi_oracle_contract` – the address of the `MultiOracleContract`
+    ///   that this feed delegates to.
+    pub fn get_max_staleness(env: Env, multi_oracle_contract: Address) -> u64 {
+        let oracle_client = MultiOracleContractClient::new(&env, &multi_oracle_contract);
+        oracle_client.max_staleness()
     }
 }
 
@@ -565,8 +702,17 @@ impl WrappedAssetBridgeContract {
         if current < amount {
             panic!("Insufficient wrapped balance");
         }
-        user_balances.set(native_asset.clone(), current - amount);
-        wrapped_balances.set(caller.clone(), user_balances);
+        if current == amount {
+            user_balances.remove(native_asset.clone());
+            if user_balances.is_empty() {
+                wrapped_balances.remove(caller.clone());
+            } else {
+                wrapped_balances.set(caller.clone(), user_balances);
+            }
+        } else {
+            user_balances.set(native_asset.clone(), current - amount);
+            wrapped_balances.set(caller.clone(), user_balances);
+        }
         env.storage().instance().set(&Symbol::new(&env, "wrapped_balances"), &wrapped_balances);
 
         env.events().publish(
@@ -677,6 +823,10 @@ impl TokenMetadataContract {
         env.storage().instance().set(&Symbol::new(&env, "metadata"), &metadata);
         env.storage().instance().set(&Symbol::new(&env, "icons"), &icons);
         env.storage().instance().set(&Symbol::new(&env, "descriptions"), &descriptions);
+    }
+}
+
+#[contract]
 pub struct DelegationContract;
 
 #[contractimpl]
@@ -703,6 +853,8 @@ impl DelegationContract {
 
     pub fn delegate(&self, env: &Env, delegator: Address, representative: Address) {
         delegator.require_auth();
+        // Self-delegation stores a meaningless mapping and adds cost to every
+        // `get_voting_power` walk, so reject it outright.
         if delegator == representative {
             panic!("Cannot delegate to self");
         }
@@ -719,15 +871,25 @@ impl DelegationContract {
             }
         }
         let mut updated = delegates;
-        updated.set(delegator, representative);
+        updated.set(delegator.clone(), representative.clone());
         env.storage().instance().set(&"delegates", &updated);
+
+        env.events().publish(
+            (Symbol::new(env, "delegated"), &delegator),
+            &representative,
+        );
     }
 
     pub fn clear_delegation(&self, env: &Env, delegator: Address) {
         delegator.require_auth();
         let mut delegates: Map<Address, Address> = env.storage().instance().get(&"delegates").unwrap_or_else(|| Map::new(env));
-        delegates.remove(delegator);
+        delegates.remove(delegator.clone());
         env.storage().instance().set(&"delegates", &delegates);
+
+        env.events().publish(
+            (Symbol::new(env, "delegation_cleared"), &delegator),
+            (),
+        );
     }
 
     pub fn get_delegate(env: Env, delegator: Address) -> Option<Address> {
@@ -763,7 +925,10 @@ impl DelegationContract {
 pub struct Proposal {
     pub id: u32,
     pub author: Address,
-    pub title: Symbol,
+    pub title: String,
+    /// Link to the full proposal text (e.g. an `ipfs://` or `https://` URI).
+    /// Empty when the proposal was created without one.
+    pub reference_uri: String,
     pub start_time: u64,
     pub end_time: u64,
     pub executed: bool,
@@ -799,10 +964,32 @@ impl GovernanceContract {
         env.storage().instance().set(&Symbol::new(&env, "votes_for"), &Map::<u32, i128>::new(&env));
         env.storage().instance().set(&Symbol::new(&env, "votes_against"), &Map::<u32, i128>::new(&env));
         env.storage().instance().set(&Symbol::new(&env, "has_voted"), &Map::<(u32, Address), bool>::new(&env));
+        // CONTRACT-032: per-proposal, per-voter power snapshot.  Populated by
+        // `snapshot_voting_power`; read by `cast_vote`.
+        env.storage().instance().set(&Symbol::new(&env, "vp_snapshot"), &Map::<(u32, Address), i128>::new(&env));
     }
 
-    pub fn create_proposal(&self, env: &Env, author: Address, title: Symbol, duration: u64) {
+    pub fn create_proposal(&self, env: &Env, author: Address, title: String, duration: u64) {
+        self.create_proposal_with_uri(env, author, title, duration, String::from_str(env, ""));
+    }
+
+    /// Create a proposal that also records a `reference_uri` pointing at the
+    /// full proposal text, so UIs have a source of truth beyond the short title.
+    pub fn create_proposal_with_uri(
+        &self,
+        env: &Env,
+        author: Address,
+        title: String,
+        duration: u64,
+        reference_uri: String,
+    ) {
         author.require_auth();
+        if title.len() == 0 {
+            panic!("Proposal title cannot be empty");
+        }
+        if title.len() > MAX_PROPOSAL_TITLE_BYTES {
+            panic!("Proposal title exceeds 256 bytes");
+        }
 
         let current_time = env.ledger().timestamp();
         let mut proposal_count: u32 = env.storage().instance().get(&Symbol::new(&env, "proposal_count")).unwrap_or(0);
@@ -812,6 +999,7 @@ impl GovernanceContract {
             id,
             author: author.clone(),
             title: title.clone(),
+            reference_uri,
             start_time: current_time,
             end_time: current_time + duration,
             executed: false,
@@ -839,6 +1027,62 @@ impl GovernanceContract {
         );
     }
 
+    /// CONTRACT-032: Snapshot a voter's governance-token balance for a specific
+    /// proposal.  Must be called while the proposal's voting window is active
+    /// (between `start_time` and `end_time`).  Once stored the snapshot is
+    /// immutable — the first recorded value is kept on subsequent calls, so a
+    /// voter cannot inflate their weight by acquiring tokens after registering.
+    ///
+    /// `cast_vote` will panic if no snapshot has been registered for the
+    /// `(proposal_id, voter)` pair, so voters must call this before voting.
+    pub fn snapshot_voting_power(&self, env: &Env, proposal_id: u32, voter: Address) {
+        voter.require_auth();
+
+        let proposals: Map<u32, Proposal> =
+            env.storage().instance().get(&Symbol::new(&env, "proposals")).unwrap_or_else(|| Map::new(env));
+        let proposal = proposals.get(proposal_id).unwrap_or_else(|| panic!("Proposal not found"));
+
+        let now = env.ledger().timestamp();
+        if now < proposal.start_time || now > proposal.end_time {
+            panic!("Snapshot only allowed during the active voting period");
+        }
+
+        let mut vp_snapshot: Map<(u32, Address), i128> =
+            env.storage().instance().get(&Symbol::new(&env, "vp_snapshot")).unwrap_or_else(|| Map::new(env));
+
+        // Idempotent: keep the first snapshot; ignore subsequent calls.
+        if vp_snapshot.contains_key((proposal_id, voter.clone())) {
+            return;
+        }
+
+        let governance_token: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "governance_token"))
+            .unwrap_or_else(|| panic!("Governance token not set"));
+
+        // Build a Vec<Val> to satisfy invoke_contract's call convention.
+        let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
+        args.push_back(voter.clone().to_val());
+        let balance: i128 = env.invoke_contract(&governance_token, &Symbol::new(&env, "balance"), args);
+
+        vp_snapshot.set((proposal_id, voter.clone()), balance);
+        env.storage().instance().set(&Symbol::new(&env, "vp_snapshot"), &vp_snapshot);
+
+        env.events().publish(
+            (Symbol::new(&env, "vp_snapshotted"), &voter),
+            (proposal_id, balance),
+        );
+    }
+
+    /// Return the snapshotted voting power for `voter` on `proposal_id`.
+    /// Returns `None` if `snapshot_voting_power` has not been called yet.
+    pub fn get_voting_power_snapshot(env: Env, proposal_id: u32, voter: Address) -> Option<i128> {
+        let vp_snapshot: Map<(u32, Address), i128> =
+            env.storage().instance().get(&Symbol::new(&env, "vp_snapshot")).unwrap_or_else(|| Map::new(&env));
+        vp_snapshot.get((proposal_id, voter))
+    }
+
     pub fn cast_vote(&self, env: &Env, proposal_id: u32, voter: Address, in_favor: bool) {
         voter.require_auth();
 
@@ -857,8 +1101,15 @@ impl GovernanceContract {
             panic!("Voter has already voted on this proposal");
         }
 
-        let governance_token: Address = env.storage().instance().get(&Symbol::new(&env, "governance_token")).unwrap();
-        let vote_weight: i128 = env.invoke_contract(&governance_token, &Symbol::new(&env, "balance"), (&voter,));
+        // CONTRACT-032: read the pre-registered snapshot instead of the live
+        // token balance.  A whale who acquires tokens after snapshotting cannot
+        // retroactively increase their weight, closing the last-minute delegation
+        // manipulation vector described in issue #844.
+        let vp_snapshot: Map<(u32, Address), i128> =
+            env.storage().instance().get(&Symbol::new(&env, "vp_snapshot")).unwrap_or_else(|| Map::new(env));
+        let vote_weight: i128 = vp_snapshot
+            .get((proposal_id, voter.clone()))
+            .unwrap_or_else(|| panic!("Voting power not snapshotted: call snapshot_voting_power first"));
 
         if vote_weight <= 0 {
             panic!("Voter has no governance tokens");
@@ -958,6 +1209,25 @@ impl GovernanceContract {
         env.storage().instance().get(&Symbol::new(&env, "proposal_count")).unwrap_or(0)
     }
 
+    /// Re-bind the governance token after a migration/re-issue, so the contract
+    /// does not have to be redeployed (and its proposals/votes lost). Admin only.
+    pub fn update_governance_token(&self, env: &Env, new_token: Address) {
+        let admin: Address = env.storage().instance().get(&Symbol::new(&env, "admin")).unwrap_or_else(|| panic!("Admin not set"));
+        admin.require_auth();
+
+        let old_token: Address = env.storage().instance().get(&Symbol::new(&env, "governance_token")).unwrap_or_else(|| panic!("Governance token not set"));
+        env.storage().instance().set(&Symbol::new(&env, "governance_token"), &new_token);
+
+        env.events().publish(
+            (Symbol::new(&env, "governance_token_updated"), &admin),
+            (old_token, new_token),
+        );
+    }
+
+    pub fn governance_token(&self, env: Env) -> Address {
+        env.storage().instance().get(&Symbol::new(&env, "governance_token")).unwrap_or_else(|| panic!("Governance token not set"))
+    }
+
     pub fn set_quorum(&self, env: &Env, quorum_bps: u32) {
         let admin: Address = env.storage().instance().get(&Symbol::new(&env, "admin")).unwrap_or_else(|| panic!("Admin not set"));
         admin.require_auth();
@@ -1009,18 +1279,6 @@ impl QuoteLockContract {
         }
         if quote.creator != executor {
             panic!("Only quote creator can execute");
-        }
-        quote.executed = true;
-        quotes.set(id, quote.clone());
-        env.storage().instance().set(&"quotes", &quotes);
-        quote
-    }
-
-    pub fn get_quote(env: Env, id: Symbol) -> LockedQuote {
-        let quotes: Map<Symbol, LockedQuote> = env.storage().instance().get(&"quotes").unwrap_or_else(|| panic!("Quote not found"));
-        quotes.get(id).unwrap_or_else(|| panic!("Quote not found"))
-    }
-}
         }
         quote.executed = true;
         quotes.set(id, quote.clone());
@@ -1140,9 +1398,13 @@ impl PaymentContract {
             env.invoke_contract::<()>(
                 &token,
                 &Symbol::new(&env, "transfer"),
-                (sender.clone(), recipient, amount),
+                (sender.clone(), recipient.clone(), amount),
             );
             Self::increment_payment_count(&env, &sender);
+            env.events().publish(
+                (Symbol::new(&env, "payout_sent"), sender.clone()),
+                (recipient, amount),
+            );
         }
 
         // Emit batch_payment_sent event.
@@ -2967,3 +3229,6 @@ impl RefundContract {
         records.get(donation_id).map(|r| r.refunded).unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod test;

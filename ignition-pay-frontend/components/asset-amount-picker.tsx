@@ -7,7 +7,6 @@ import {
   spendableBalance,
   validateAmount,
   type SendableAsset,
-  MAX_DECIMAL_PLACES,
 } from '@/features/send/models'
 
 interface AssetAmountPickerProps {
@@ -87,7 +86,9 @@ export function AssetAmountPicker({
                 onAmountChange(val)
                 return
               }
-              const regex = new RegExp(`^\\d*\\.?\\d{0,${MAX_DECIMAL_PLACES}}$`)
+              // Keep over-precision input visible so validateAmount can show
+              // the user why it cannot be sent instead of silently dropping it.
+              const regex = /^\d*\.?\d*$/
               if (regex.test(val)) {
                 onAmountChange(val)
               }
